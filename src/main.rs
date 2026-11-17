@@ -46,6 +46,7 @@ code{{background:#1b1b1f;padding:2px 6px;border-radius:4px;word-break:break-all}
 <p>Add this address as a custom connector in your app:</p>
 <p><code>{url}</code></p>
 <p>We keep your Google account ID and an encrypted sign-in token, nothing else. Search data passes straight through and is never stored.</p>
+<p><a href="https://modelbrain.net/connectors.html">Setup guide</a> · <a href="https://modelbrain.net/legal/privacy-policy.html">Privacy policy</a> · <a href="https://modelbrain.net/legal/terms.html">Terms</a> · <a href="https://github.com/ModelBrain/modelbrain-connectors">Source code (MIT)</a></p>
 <p>Made by <a href="https://modelbrain.net/">ModelBrain</a>, the memory layer that gives your assistants one shared memory.</p>
 </main></body></html>"#
     )
@@ -172,6 +173,8 @@ mod tests {
         let html = landing_html(&st);
         assert!(html.contains("https://gsc.example.test/mcp"));
         assert!(!html.contains('\u{2014}'));
+        // Google's branding check needs the privacy policy linked from the app's page.
+        assert!(html.contains("https://modelbrain.net/legal/privacy-policy.html"));
         let _router = app(st);
     }
 }
