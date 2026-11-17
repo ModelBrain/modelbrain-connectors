@@ -1,0 +1,17 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "net.modelbrain/search-console",
+  "description": "Free, read-only Google Search Console for Claude, ChatGPT and Cursor. Every property, 16 months.",
+  "version": "0.1.0",
+  "remotes": [
+    {
+      "type": "streamable-http",
+      "url": "https://gsc.modelbrain.net/mcp"
+    }
+  ],
+  "repository": {
+    "url": "https://github.com/ModelBrain/modelbrain-connectors",
+    "source": "github"
+  },
+  "websiteUrl": "https://modelbrain.net/connectors.html"
+}
