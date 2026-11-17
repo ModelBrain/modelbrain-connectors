@@ -1,0 +1,54 @@
+# ModelBrain free connectors: one Swarm stack, one service per connector.
+# Joins the shared `edge` network that the box's Caddy sits on, like the
+# relay. Stack name: modelbrain-connectors (separate from the platform and
+# the relay, so each redeploys on its own).
+services:
+  gsc:
+    image: ${MBC_IMAGE:-modelbrain-connectors:latest}
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    networks: [edge]
+    environment:
+      CONNECTOR: gsc
+      BASE_URL: ${MBC_GSC_BASE_URL:?set in deploy.env, e.g. https://gsc.modelbrain.net}
+      GOOGLE_OAUTH_JSON_FILE: /run/secrets/mbc_google_oauth_json
+      TOKEN_KEY_FILE: /run/secrets/mbc_token_key
+      DB_PATH: /data/gsc.db
+      CALLS_PER_MINUTE: "60"
+      RUST_LOG: info
+    secrets:
+      - mbc_google_oauth_json
+      - mbc_token_key
+    volumes:
+      - gsc-data:/data
+    deploy:
+      # One replica: the token store is a single SQLite file on this volume.
+      replicas: 1
+      update_config:
+        order: start-first
+        failure_action: rollback
+      restart_policy:
+        condition: on-failure
+        delay: 5s
+        max_attempts: 5
+        window: 30s
+      resources:
+        limits:
+          memory: 128M
+
+volumes:
+  gsc-data:
+
+secrets:
+  # Created once on the box (see infra/README.md). Never in git.
+  mbc_google_oauth_json:
+    external: true
+  mbc_token_key:
+    external: true
+
+networks:
+  edge:
+    external: true

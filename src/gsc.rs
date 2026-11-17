@@ -37,7 +37,7 @@ fn annotations(title: &str) -> Value {
 fn site_prop() -> Value {
     json!({
         "type": "string",
-        "description": "The Search Console property exactly as list_sites returns it, for example https://example.com/ or sc-domain:example.com"
+        "description": "The Search Console property, for example sc-domain:example.com or https://example.com/. A plain domain or page URL also works: it is matched to the right property."
     })
 }
 
@@ -303,11 +303,15 @@ impl Delta {
     pub fn change(&self) -> f64 {
         self.clicks_now - self.clicks_before
     }
+
+    pub fn impressions_change(&self) -> f64 {
+        self.impressions_now - self.impressions_before
+    }
 }
 
 /// Joins two periods by key. Returns (risers, fallers), each sorted by the
 /// size of the click change and cut to `limit`.
-pub fn diff_rows(current: &[Row], previous: &[Row], limit: usize) -> (Vec<Delta>, Vec<Delta>) {
+pub fn diff_rows(current: &[Row], previous: &[Row], limit: usize, by_impressions: bool) -> (Vec<Delta>, Vec<Delta>) {
     let mut map: HashMap<String, Delta> = HashMap::new();
     let blank = |key: &str| Delta {
         key: key.to_string(),
@@ -332,10 +336,11 @@ pub fn diff_rows(current: &[Row], previous: &[Row], limit: usize) -> (Vec<Delta>
         d.impressions_before = r.impressions;
         d.position_before = Some(r.position);
     }
-    let mut risers: Vec<Delta> = map.values().filter(|d| d.change() > 0.0).cloned().collect();
-    let mut fallers: Vec<Delta> = map.values().filter(|d| d.change() < 0.0).cloned().collect();
-    risers.sort_by(|a, b| b.change().total_cmp(&a.change()).then_with(|| a.key.cmp(&b.key)));
-    fallers.sort_by(|a, b| a.change().total_cmp(&b.change()).then_with(|| a.key.cmp(&b.key)));
+    let m = |d: &Delta| if by_impressions { d.impressions_change() } else { d.change() };
+    let mut risers: Vec<Delta> = map.values().filter(|d| m(d) > 0.0).cloned().collect();
+    let mut fallers: Vec<Delta> = map.values().filter(|d| m(d) < 0.0).cloned().collect();
+    risers.sort_by(|a, b| m(b).total_cmp(&m(a)).then_with(|| a.key.cmp(&b.key)));
+    fallers.sort_by(|a, b| m(a).total_cmp(&m(b)).then_with(|| a.key.cmp(&b.key)));
     risers.truncate(limit);
     fallers.truncate(limit);
     (risers, fallers)
@@ -346,19 +351,20 @@ fn fmt_pos(p: Option<f64>) -> String {
 }
 
 fn format_deltas(title: &str, dim: &str, list: &[Delta]) -> String {
-    let mut out = format!("\n{title}\n{dim}\tclicks_now\tclicks_before\tchange\timpressions_now\timpressions_before\tposition_now\tposition_before\n");
+    let mut out = format!("\n{title}\n{dim}\tclicks_now\tclicks_before\tclick_change\timpressions_now\timpressions_before\timpression_change\tposition_now\tposition_before\n");
     if list.is_empty() {
         out.push_str("(none)\n");
     }
     for d in list {
         out.push_str(&format!(
-            "{}\t{}\t{}\t{:+}\t{}\t{}\t{}\t{}\n",
+            "{}\t{}\t{}\t{:+}\t{}\t{}\t{:+}\t{}\t{}\n",
             clean_cell(&d.key),
             d.clicks_now,
             d.clicks_before,
             d.change(),
             d.impressions_now,
             d.impressions_before,
+            d.impressions_change(),
             fmt_pos(d.position_now),
             fmt_pos(d.position_before)
         ));
@@ -389,9 +395,48 @@ pub async fn call(st: &AppState, sub: &str, name: &str, args: &Value) -> Result<
     }
 }
 
-async fn list_sites(st: &AppState, sub: &str) -> Result<String, String> {
+/// The host a property or URL refers to, without "www.".
+fn host_of(site: &str) -> Option<String> {
+    let s = site.trim();
+    if let Some(d) = s.strip_prefix("sc-domain:") {
+        return Some(d.trim().trim_end_matches('/').to_ascii_lowercase());
+    }
+    let with_scheme = if s.contains("://") { s.to_string() } else { format!("https://{s}") };
+    let u = url::Url::parse(&with_scheme).ok()?;
+    u.host_str()
+        .map(|h| h.strip_prefix("www.").unwrap_or(h).to_ascii_lowercase())
+}
+
+/// Maps what the assistant typed (a URL, a bare domain, a missing slash) to
+/// the exact property name Search Console uses. Order: exact match, then the
+/// domain property for that host or any parent domain, then a URL-prefix
+/// property on the same host.
+pub fn pick_site(input: &str, owned: &[String]) -> Option<String> {
+    let norm = |s: &str| s.trim().trim_end_matches('/').to_ascii_lowercase();
+    if let Some(exact) = owned.iter().find(|o| norm(o) == norm(input)) {
+        return Some(exact.clone());
+    }
+    let host = host_of(input)?;
+    let mut candidate = host.as_str();
+    loop {
+        let dom = format!("sc-domain:{candidate}");
+        if let Some(found) = owned.iter().find(|o| o.eq_ignore_ascii_case(&dom)) {
+            return Some(found.clone());
+        }
+        match candidate.split_once('.') {
+            Some((_, rest)) if rest.contains('.') => candidate = rest,
+            _ => break,
+        }
+    }
+    owned
+        .iter()
+        .find(|o| !o.starts_with("sc-domain:") && host_of(o).as_deref() == Some(host.as_str()))
+        .cloned()
+}
+
+async fn fetch_sites(st: &AppState, sub: &str) -> Result<Vec<(String, String)>, String> {
     let v = google::call(st, sub, Method::GET, &format!("{API}/webmasters/v3/sites"), None).await?;
-    let mut sites: Vec<(String, String)> = v["siteEntry"]
+    let sites = v["siteEntry"]
         .as_array()
         .map(|list| {
             list.iter()
@@ -404,6 +449,30 @@ async fn list_sites(st: &AppState, sub: &str) -> Result<String, String> {
                 .collect()
         })
         .unwrap_or_default();
+    Ok(sites)
+}
+
+/// Returns the property to query plus a note when it differs from the input.
+async fn resolve_site(st: &AppState, sub: &str, input: &str) -> Result<(String, String), String> {
+    if input.starts_with("sc-domain:") {
+        return Ok((input.to_string(), String::new()));
+    }
+    let owned: Vec<String> = fetch_sites(st, sub).await?.into_iter().map(|(u, _)| u).collect();
+    match pick_site(input, &owned) {
+        Some(found) if found == input => Ok((found, String::new())),
+        Some(found) => {
+            let note = format!("(Using the property {found} for {input}.)\n");
+            Ok((found, note))
+        }
+        None => Err(format!(
+            "No Search Console property in this account matches {input}. Properties available: {}",
+            if owned.is_empty() { "none".to_string() } else { owned.join(", ") }
+        )),
+    }
+}
+
+async fn list_sites(st: &AppState, sub: &str) -> Result<String, String> {
+    let mut sites = fetch_sites(st, sub).await?;
     if sites.is_empty() {
         return Ok("This Google account has no Search Console properties. Add or verify a site at https://search.google.com/search-console first.".into());
     }
@@ -421,7 +490,8 @@ async fn query(st: &AppState, sub: &str, site: &str, body: &Value) -> Result<Val
 }
 
 async fn search_performance(st: &AppState, sub: &str, args: &Value) -> Result<String, String> {
-    let site = required_str(args, "site_url")?;
+    let (site, note) = resolve_site(st, sub, required_str(args, "site_url")?).await?;
+    let site = site.as_str();
     let (start, end) = resolve_range(str_arg(args, "start_date"), str_arg(args, "end_date"), today())?;
     let dimensions: Vec<String> = args
         .get("dimensions")
@@ -451,7 +521,7 @@ async fn search_performance(st: &AppState, sub: &str, args: &Value) -> Result<St
     let v = query(st, sub, site, &Value::Object(body)).await?;
     let rows = parse_rows(&v);
     let mut out = format!(
-        "{site}, {start} to {end}, {search_type} search, {} rows from row {start_row}\n",
+        "{note}{site}, {start} to {end}, {search_type} search, {} rows from row {start_row}\n",
         rows.len()
     );
     if rows.is_empty() {
@@ -469,22 +539,46 @@ async fn search_performance(st: &AppState, sub: &str, args: &Value) -> Result<St
 }
 
 async fn inspect_url(st: &AppState, sub: &str, args: &Value) -> Result<String, String> {
-    let site = required_str(args, "site_url")?;
+    let (site, note) = resolve_site(st, sub, required_str(args, "site_url")?).await?;
+    let site = site.as_str();
     let url = required_str(args, "url")?;
     let lang = str_arg(args, "language_code").unwrap_or("en-US");
     let body = json!({ "inspectionUrl": url, "siteUrl": site, "languageCode": lang });
     let v = google::call(st, sub, Method::POST, &format!("{API}/v1/urlInspection/index:inspect"), Some(&body)).await?;
-    let result = v.get("inspectionResult").cloned().unwrap_or(v);
-    serde_json::to_string_pretty(&result).map_err(|e| e.to_string())
+    let mut result = v.get("inspectionResult").cloned().unwrap_or(v);
+    if result["mobileUsabilityResult"]["verdict"].as_str() == Some("VERDICT_UNSPECIFIED") {
+        if let Some(obj) = result.as_object_mut() {
+            // Google retired the mobile usability report; the field is empty.
+            obj.remove("mobileUsabilityResult");
+        }
+    }
+    let text = serde_json::to_string_pretty(&result).map_err(|e| e.to_string())?;
+    Ok(format!("{note}{text}"))
 }
 
 async fn list_sitemaps(st: &AppState, sub: &str, args: &Value) -> Result<String, String> {
-    let site = required_str(args, "site_url")?;
+    let (site, note) = resolve_site(st, sub, required_str(args, "site_url")?).await?;
+    let site = site.as_str();
     let url = format!("{API}/webmasters/v3/sites/{}/sitemaps", site_path(site));
     let v = google::call(st, sub, Method::GET, &url, None).await?;
+    let mut v = v;
+    if let Some(list) = v.get_mut("sitemap").and_then(Value::as_array_mut) {
+        for sm in list.iter_mut() {
+            if let Some(contents) = sm.get_mut("contents").and_then(Value::as_array_mut) {
+                for c in contents.iter_mut() {
+                    if let Some(obj) = c.as_object_mut() {
+                        // Google stopped reporting this; it is always "0".
+                        obj.remove("indexed");
+                    }
+                }
+            }
+        }
+    }
     match v.get("sitemap").and_then(Value::as_array) {
-        Some(list) if !list.is_empty() => serde_json::to_string_pretty(list).map_err(|e| e.to_string()),
-        _ => Ok(format!("No sitemaps are submitted for {site}.")),
+        Some(list) if !list.is_empty() => serde_json::to_string_pretty(list)
+            .map(|t| format!("{note}{t}"))
+            .map_err(|e| e.to_string()),
+        _ => Ok(format!("{note}No sitemaps are submitted for {site}.")),
     }
 }
 
@@ -508,13 +602,17 @@ async fn totals_and_rows(
         }
         b
     };
-    let totals = query(st, sub, site, &base(None, 1)).await?;
-    let rows = query(st, sub, site, &base(Some(dimension), 5000)).await?;
+    let (totals_body, rows_body) = (base(None, 1), base(Some(dimension), 5000));
+    let (totals, rows) = tokio::try_join!(
+        query(st, sub, site, &totals_body),
+        query(st, sub, site, &rows_body)
+    )?;
     Ok((parse_rows(&totals).into_iter().next(), parse_rows(&rows)))
 }
 
 async fn compare_periods(st: &AppState, sub: &str, args: &Value) -> Result<String, String> {
-    let site = required_str(args, "site_url")?;
+    let (site, note) = resolve_site(st, sub, required_str(args, "site_url")?).await?;
+    let site = site.as_str();
     let current = resolve_range(str_arg(args, "current_start"), str_arg(args, "current_end"), today())?;
     let previous = match (str_arg(args, "previous_start"), str_arg(args, "previous_end")) {
         (None, None) => previous_range(current.0, current.1),
@@ -535,14 +633,16 @@ async fn compare_periods(st: &AppState, sub: &str, args: &Value) -> Result<Strin
     let search_type = validated_search_type(args)?;
     let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(10).clamp(1, 50) as usize;
 
-    let (cur_tot, cur_rows) = totals_and_rows(st, sub, site, current, search_type, dimension).await?;
-    let (prev_tot, prev_rows) = totals_and_rows(st, sub, site, previous, search_type, dimension).await?;
+    let ((cur_tot, cur_rows), (prev_tot, prev_rows)) = tokio::try_join!(
+        totals_and_rows(st, sub, site, current, search_type, dimension),
+        totals_and_rows(st, sub, site, previous, search_type, dimension)
+    )?;
 
     let t = |r: &Option<Row>| r.clone().unwrap_or(Row { keys: vec![], clicks: 0.0, impressions: 0.0, ctr: 0.0, position: 0.0 });
     let (c, p) = (t(&cur_tot), t(&prev_tot));
 
     let mut out = format!(
-        "{site}, {search_type} search\ncurrent: {} to {}\nprevious: {} to {}\n\nmetric\tcurrent\tprevious\tchange\n",
+        "{note}{site}, {search_type} search\ncurrent: {} to {}\nprevious: {} to {}\n\nmetric\tcurrent\tprevious\tchange\n",
         current.0, current.1, previous.0, previous.1
     );
     out.push_str(&format!("clicks\t{}\t{}\t{}\n", c.clicks, p.clicks, pct_change(c.clicks, p.clicks)));
@@ -555,9 +655,15 @@ async fn compare_periods(st: &AppState, sub: &str, args: &Value) -> Result<Strin
     out.push_str(&format!("ctr_percent\t{:.2}\t{:.2}\t{:+.2} points\n", c.ctr * 100.0, p.ctr * 100.0, (c.ctr - p.ctr) * 100.0));
     out.push_str(&format!("position\t{:.1}\t{:.1}\t{:+.1}\n", c.position, p.position, c.position - p.position));
 
-    let (risers, fallers) = diff_rows(&cur_rows, &prev_rows, limit);
-    out.push_str(&format_deltas("Biggest gains in clicks", dimension, &risers));
-    out.push_str(&format_deltas("Biggest losses in clicks", dimension, &fallers));
+    let (mut risers, mut fallers) = diff_rows(&cur_rows, &prev_rows, limit, false);
+    let mut metric = "clicks";
+    if risers.is_empty() && fallers.is_empty() {
+        (risers, fallers) = diff_rows(&cur_rows, &prev_rows, limit, true);
+        metric = "impressions";
+        out.push_str(&format!("\nNo {dimension} changed in clicks between the periods, so these are ranked by impressions.\n"));
+    }
+    out.push_str(&format_deltas(&format!("Biggest gains in {metric}"), dimension, &risers));
+    out.push_str(&format_deltas(&format!("Biggest losses in {metric}"), dimension, &fallers));
     if cur_rows.len() >= 5000 || prev_rows.len() >= 5000 {
         out.push_str("\nRisers and fallers are drawn from the top 5,000 rows of each period.\n");
     }
@@ -617,12 +723,18 @@ mod tests {
         let row = |k: &str, c: f64| Row { keys: vec![k.into()], clicks: c, impressions: c * 10.0, ctr: 0.1, position: 5.0 };
         let cur = vec![row("a", 50.0), row("b", 5.0), row("new", 8.0)];
         let prev = vec![row("a", 20.0), row("b", 30.0), row("gone", 4.0)];
-        let (up, down) = diff_rows(&cur, &prev, 10);
+        let (up, down) = diff_rows(&cur, &prev, 10, false);
         assert_eq!(up.iter().map(|d| d.key.as_str()).collect::<Vec<_>>(), vec!["a", "new"]);
         assert_eq!(down.iter().map(|d| d.key.as_str()).collect::<Vec<_>>(), vec!["b", "gone"]);
         assert_eq!(up[1].position_before, None);
-        let (up1, _) = diff_rows(&cur, &prev, 1);
+        let (up1, _) = diff_rows(&cur, &prev, 1, false);
         assert_eq!(up1.len(), 1);
+
+        let flat = |k: &str, i: f64| Row { keys: vec![k.into()], clicks: 0.0, impressions: i, ctr: 0.0, position: 9.0 };
+        let (c_up, c_down) = diff_rows(&[flat("x", 50.0)], &[flat("x", 5.0)], 10, false);
+        assert!(c_up.is_empty() && c_down.is_empty());
+        let (i_up, _) = diff_rows(&[flat("x", 50.0)], &[flat("x", 5.0)], 10, true);
+        assert_eq!(i_up[0].impressions_change(), 45.0);
     }
 
     #[test]
@@ -646,6 +758,22 @@ mod tests {
             assert_eq!(t["annotations"]["readOnlyHint"], json!(true));
             assert_eq!(t["inputSchema"]["type"], json!("object"));
         }
+    }
+
+    #[test]
+    fn picks_the_right_property() {
+        let owned: Vec<String> = ["sc-domain:nexspark.com", "https://shop.example.org/", "sc-domain:modelbrain.net"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(pick_site("https://nexspark.com", &owned).as_deref(), Some("sc-domain:nexspark.com"));
+        assert_eq!(pick_site("nexspark.com", &owned).as_deref(), Some("sc-domain:nexspark.com"));
+        assert_eq!(pick_site("https://www.nexspark.com/blog/post", &owned).as_deref(), Some("sc-domain:nexspark.com"));
+        assert_eq!(pick_site("https://blog.modelbrain.net/", &owned).as_deref(), Some("sc-domain:modelbrain.net"));
+        assert_eq!(pick_site("https://shop.example.org", &owned).as_deref(), Some("https://shop.example.org/"));
+        assert_eq!(pick_site("sc-domain:NEXSPARK.com", &owned).as_deref(), Some("sc-domain:nexspark.com"));
+        assert_eq!(pick_site("https://unknown.com/", &owned), None);
+        assert_eq!(pick_site("example.org", &owned), None);
     }
 
     #[test]

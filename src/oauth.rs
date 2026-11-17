@@ -86,6 +86,24 @@ pub fn redirect_allowed(raw: &str, extra_hosts: &[String]) -> bool {
     }
 }
 
+/// Exact match, except that loopback addresses may use any port (RFC 8252
+/// section 7.3): local apps such as the MCP Inspector pick a port each run.
+pub fn redirect_matches(registered: &str, requested: &str) -> bool {
+    if registered == requested {
+        return true;
+    }
+    let (Ok(a), Ok(b)) = (url::Url::parse(registered), url::Url::parse(requested)) else {
+        return false;
+    };
+    let loopback = |u: &url::Url| u.scheme() == "http" && matches!(u.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"));
+    loopback(&a)
+        && loopback(&b)
+        && a.host_str() == b.host_str()
+        && a.path() == b.path()
+        && a.query() == b.query()
+        && b.fragment().is_none()
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -278,8 +296,14 @@ async fn authorize(State(st): State<Shared>, Query(q): Query<AuthorizeQuery>) ->
     let Some(redirect_uri) = q.redirect_uri.clone() else {
         return bad("The app did not give a return address.");
     };
-    if !client.redirect_uris.iter().any(|u| u == &redirect_uri) {
-        return bad("The app's return address does not match the one it registered.");
+    if !client.redirect_uris.iter().any(|u| redirect_matches(u, &redirect_uri)) {
+        tracing::warn!(
+            event = "redirect_mismatch",
+            client = %client.client_name,
+            requested = %redirect_uri,
+            registered = ?client.redirect_uris
+        );
+        return bad("The app's return address does not match the one it registered. Remove the connector in your app and add it again.");
     }
     if q.response_type.as_deref() != Some("code") {
         return redirect_with(&redirect_uri, &[("error", "unsupported_response_type")]);
@@ -628,6 +652,17 @@ mod tests {
 
         let extra = vec!["example.dev".to_string()];
         assert!(redirect_allowed("https://app.example.dev/cb", &extra));
+    }
+
+    #[test]
+    fn loopback_ports_may_vary() {
+        assert!(redirect_matches("https://claude.ai/cb", "https://claude.ai/cb"));
+        assert!(!redirect_matches("https://claude.ai/cb", "https://claude.ai/other"));
+        assert!(redirect_matches("http://localhost:6274/oauth/callback", "http://localhost:6277/oauth/callback"));
+        assert!(redirect_matches("http://127.0.0.1/cb", "http://127.0.0.1:5000/cb"));
+        assert!(!redirect_matches("http://localhost:6274/oauth/callback", "http://localhost:6274/evil"));
+        assert!(!redirect_matches("http://localhost:6274/cb", "http://127.0.0.1:6274/cb"));
+        assert!(!redirect_matches("https://claude.ai:443/cb", "https://claude.ai:8443/cb"));
     }
 
     fn fake_id_token(claims: Value) -> String {

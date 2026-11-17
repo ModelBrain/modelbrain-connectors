@@ -276,8 +276,11 @@ impl Store {
     /// drop every token we issued for that account, so the client signs in again.
     pub fn revoke_account(&self, sub: &str) -> rusqlite::Result<()> {
         let conn = self.c();
-        conn.execute("UPDATE accounts SET revoked=1, updated=?2 WHERE sub=?1", params![sub, now()])?;
+        // Delete outright: nothing about the account is kept once Google
+        // access is gone. Signing in again creates a fresh row.
+        conn.execute("DELETE FROM accounts WHERE sub=?1", params![sub])?;
         conn.execute("DELETE FROM tokens WHERE sub=?1", params![sub])?;
+        conn.execute("DELETE FROM codes WHERE sub=?1", params![sub])?;
         Ok(())
     }
 
@@ -287,6 +290,13 @@ impl Store {
         conn.execute("DELETE FROM pending WHERE created < ?1", params![t - PENDING_TTL])?;
         conn.execute("DELETE FROM codes WHERE expires <= ?1", params![t])?;
         conn.execute("DELETE FROM tokens WHERE expires <= ?1", params![t])?;
+        // An account nobody has used for the refresh lifetime has no tokens
+        // left; delete it and its sealed Google token.
+        conn.execute(
+            "DELETE FROM accounts WHERE revoked=1
+               OR (updated < ?1 AND sub NOT IN (SELECT sub FROM tokens))",
+            params![t - REFRESH_TTL],
+        )?;
         Ok(())
     }
 }
@@ -356,6 +366,18 @@ mod tests {
         // Signing in again restores the account.
         s.upsert_account("sub1", b"new-sealed", "scope").unwrap();
         assert_eq!(s.account_refresh("sub1").unwrap(), Some(b"new-sealed".to_vec()));
+    }
+
+    #[test]
+    fn idle_accounts_are_purged() {
+        let s = Store::open_in_memory().unwrap();
+        s.upsert_account("active", b"x", "scope").unwrap();
+        s.upsert_account("idle", b"y", "scope").unwrap();
+        s.c().execute("UPDATE accounts SET updated=?1", params![now() - REFRESH_TTL - 10]).unwrap();
+        s.insert_token("t", TokenKind::Refresh, "c", "active", 60).unwrap();
+        s.purge_expired().unwrap();
+        assert!(s.account_exists("active").unwrap());
+        assert!(!s.account_exists("idle").unwrap());
     }
 
     #[test]
