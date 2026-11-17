@@ -263,6 +263,16 @@ pub fn parse_rows(v: &Value) -> Vec<Row> {
         .unwrap_or_default()
 }
 
+/// Most clicks first, then most impressions, then by key for a stable order.
+pub fn rank_rows(rows: &mut [Row]) {
+    rows.sort_by(|a, b| {
+        b.clicks
+            .total_cmp(&a.clicks)
+            .then_with(|| b.impressions.total_cmp(&a.impressions))
+            .then_with(|| a.keys.cmp(&b.keys))
+    });
+}
+
 fn clean_cell(s: &str) -> String {
     s.replace(['\t', '\n', '\r'], " ")
 }
@@ -509,7 +519,13 @@ async fn search_performance(st: &AppState, sub: &str, args: &Value) -> Result<St
     body.insert("startDate".into(), json!(start.to_string()));
     body.insert("endDate".into(), json!(end.to_string()));
     body.insert("type".into(), json!(search_type));
-    body.insert("rowLimit".into(), json!(row_limit));
+    // Google sorts by clicks and breaks ties alphabetically, so on a site
+    // where most rows have 0 clicks a small row_limit returns the
+    // alphabetically first rows, not the most seen. On the first page,
+    // fetch a wider set and rank it here by clicks, then impressions.
+    let rank_locally = start_row == 0 && !dimensions.is_empty() && !dimensions.iter().any(|d| d == "date");
+    let fetch_limit = if rank_locally { row_limit.clamp(5000, MAX_ROWS) } else { row_limit };
+    body.insert("rowLimit".into(), json!(fetch_limit));
     body.insert("startRow".into(), json!(start_row));
     if !dimensions.is_empty() {
         body.insert("dimensions".into(), json!(dimensions));
@@ -519,7 +535,12 @@ async fn search_performance(st: &AppState, sub: &str, args: &Value) -> Result<St
     }
 
     let v = query(st, sub, site, &Value::Object(body)).await?;
-    let rows = parse_rows(&v);
+    let mut rows = parse_rows(&v);
+    let fetched = rows.len() as u64;
+    if rank_locally {
+        rank_rows(&mut rows);
+        rows.truncate(row_limit as usize);
+    }
     let mut out = format!(
         "{note}{site}, {start} to {end}, {search_type} search, {} rows from row {start_row}\n",
         rows.len()
@@ -529,7 +550,12 @@ async fn search_performance(st: &AppState, sub: &str, args: &Value) -> Result<St
         return Ok(out);
     }
     out.push_str(&format_rows(&dimensions, &rows));
-    if rows.len() as u64 == row_limit {
+    if rank_locally && fetched > row_limit {
+        let more = if fetched == fetch_limit { "+" } else { "" };
+        out.push_str(&format!(
+            "Top {row_limit} of {fetched}{more} rows, ranked by clicks then impressions. Ask with a larger row_limit to see more.\n"
+        ));
+    } else if !rank_locally && rows.len() as u64 == row_limit {
         out.push_str(&format!(
             "More rows may exist: call again with start_row {}.\n",
             start_row + row_limit
@@ -774,6 +800,15 @@ mod tests {
         assert_eq!(pick_site("sc-domain:NEXSPARK.com", &owned).as_deref(), Some("sc-domain:nexspark.com"));
         assert_eq!(pick_site("https://unknown.com/", &owned), None);
         assert_eq!(pick_site("example.org", &owned), None);
+    }
+
+    #[test]
+    fn ranks_by_clicks_then_impressions() {
+        let row = |k: &str, c: f64, i: f64| Row { keys: vec![k.into()], clicks: c, impressions: i, ctr: 0.0, position: 1.0 };
+        let mut rows = vec![row("a junk", 0.0, 1.0), row("b big", 0.0, 80.0), row("c click", 2.0, 5.0), row("d mid", 0.0, 18.0)];
+        rank_rows(&mut rows);
+        let order: Vec<&str> = rows.iter().map(|r| r.keys[0].as_str()).collect();
+        assert_eq!(order, vec!["c click", "b big", "d mid", "a junk"]);
     }
 
     #[test]
