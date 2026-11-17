@@ -86,11 +86,38 @@ pub fn app(state: Shared) -> Router {
         .with_state(state)
 }
 
+/// `--stdio`: answer MCP over stdin and stdout with no secrets and no
+/// network, for directory checks that start the server and list its tools.
+async fn run_stdio() {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    let mut lines = BufReader::new(tokio::io::stdin()).lines();
+    let mut out = tokio::io::stdout();
+    while let Ok(Some(line)) = lines.next_line().await {
+        if line.trim().is_empty() {
+            continue;
+        }
+        if let Some(reply) = mcp::stdio_reply(&line) {
+            let mut text = reply.to_string();
+            text.push('\n');
+            if out.write_all(text.as_bytes()).await.is_err() || out.flush().await.is_err() {
+                break;
+            }
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() {
+    // Logs go to stderr so stdout stays clean for --stdio replies.
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
+        .with_writer(std::io::stderr)
         .init();
+
+    if std::env::args().any(|a| a == "--stdio") {
+        run_stdio().await;
+        return;
+    }
 
     let cfg = match config::Config::from_env() {
         Ok(c) => c,

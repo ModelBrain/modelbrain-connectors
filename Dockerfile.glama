@@ -1,0 +1,13 @@
+# For Glama's directory check: builds the same binary and starts it in
+# --stdio mode, which lists the tools with no secrets and no network.
+# The hosted connector itself is https://gsc.modelbrain.net/mcp.
+FROM rust:1-alpine AS builder
+RUN apk add --no-cache musl-dev gcc
+WORKDIR /build
+COPY Cargo.toml Cargo.lock ./
+COPY src ./src
+RUN cargo build --release --locked -j 2
+
+FROM alpine:3.20
+COPY --from=builder /build/target/release/modelbrain_connectors /usr/local/bin/modelbrain_connectors
+ENTRYPOINT ["/usr/local/bin/modelbrain_connectors", "--stdio"]

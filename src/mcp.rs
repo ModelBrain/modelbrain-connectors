@@ -3,7 +3,7 @@
 //! Every request needs one of our Bearer tokens. Logs carry the method, tool
 //! name, outcome and duration only: never arguments or results.
 
-use crate::{crypto::hash_token, gsc, oauth, store::{now, TokenKind}, Shared};
+use crate::{config::Connector, crypto::hash_token, gsc, oauth, store::{now, TokenKind}, Shared};
 use axum::{
     body::Bytes,
     extract::State,
@@ -51,6 +51,49 @@ impl RateLimiter {
         let mut slots = self.slots.lock().unwrap_or_else(|e| e.into_inner());
         slots.retain(|_, (m, _)| *m == minute);
     }
+}
+
+pub fn initialize_result(connector: Connector, requested: Option<&str>) -> Value {
+    json!({
+        "protocolVersion": negotiate_version(requested),
+        "capabilities": { "tools": { "listChanged": false } },
+        "serverInfo": {
+            "name": connector.server_name(),
+            "title": connector.display_name(),
+            "version": env!("CARGO_PKG_VERSION"),
+            "websiteUrl": "https://modelbrain.net/connectors.html",
+        },
+        "instructions": "Read-only Google Search Console data for every property the signed-in Google account can see. Call list_sites first to get exact property names, then search_performance, compare_periods, inspect_url or list_sitemaps.",
+    })
+}
+
+pub const HOSTED_ONLY: &str = "This copy only lists its tools. To read your Search Console data, add the hosted connector https://gsc.modelbrain.net/mcp in Claude, ChatGPT or Cursor and sign in with Google. Setup: https://modelbrain.net/connectors.html";
+
+/// One line of JSON-RPC from stdin, for directory checks (Glama) that start
+/// the server in a container with no secrets and ask what it offers. Lists
+/// tools; real calls point to the hosted connector. Returns None for
+/// notifications, which need no reply.
+pub fn stdio_reply(line: &str) -> Option<Value> {
+    let msg: Value = match serde_json::from_str(line) {
+        Ok(v) => v,
+        Err(_) => {
+            return Some(json!({ "jsonrpc": "2.0", "id": null, "error": { "code": -32700, "message": "Parse error" } }))
+        }
+    };
+    let id = msg.get("id").cloned()?;
+    let params = msg.get("params").cloned().unwrap_or(Value::Null);
+    let result = match msg["method"].as_str().unwrap_or_default() {
+        "initialize" => initialize_result(Connector::SearchConsole, params["protocolVersion"].as_str()),
+        "ping" => json!({}),
+        "tools/list" => json!({ "tools": gsc::tools() }),
+        "tools/call" => json!({ "content": [{ "type": "text", "text": HOSTED_ONLY }], "isError": true }),
+        "resources/list" => json!({ "resources": [] }),
+        "prompts/list" => json!({ "prompts": [] }),
+        _ => {
+            return Some(json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32601, "message": "Method not found" } }))
+        }
+    };
+    Some(json!({ "jsonrpc": "2.0", "id": id, "result": result }))
 }
 
 pub fn negotiate_version(requested: Option<&str>) -> &'static str {
@@ -106,23 +149,10 @@ pub async fn handle(State(st): State<Shared>, headers: HeaderMap, body: Bytes) -
     let started = Instant::now();
 
     match method.as_str() {
-        "initialize" => {
-            let version = negotiate_version(params["protocolVersion"].as_str());
-            rpc_result(
-                &id,
-                json!({
-                    "protocolVersion": version,
-                    "capabilities": { "tools": { "listChanged": false } },
-                    "serverInfo": {
-                        "name": st.cfg.connector.server_name(),
-                        "title": st.cfg.connector.display_name(),
-                        "version": env!("CARGO_PKG_VERSION"),
-                        "websiteUrl": "https://modelbrain.net/",
-                    },
-                    "instructions": "Read-only Google Search Console data for every property the signed-in Google account can see. Call list_sites first to get exact property names, then search_performance, compare_periods, inspect_url or list_sitemaps.",
-                }),
-            )
-        }
+        "initialize" => rpc_result(
+            &id,
+            initialize_result(st.cfg.connector, params["protocolVersion"].as_str()),
+        ),
         "ping" => rpc_result(&id, json!({})),
         "tools/list" => rpc_result(&id, json!({ "tools": gsc::tools() })),
         "tools/call" => {
@@ -176,6 +206,20 @@ mod tests {
         assert!(!rl.check_at("a", t + 3));
         assert!(rl.check_at("b", t + 3));
         assert!(rl.check_at("a", t + 60));
+    }
+
+    #[test]
+    fn stdio_lists_tools_without_secrets() {
+        let init = stdio_reply(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}"#).unwrap();
+        assert_eq!(init["result"]["protocolVersion"], json!("2025-06-18"));
+        assert_eq!(init["result"]["serverInfo"]["name"], json!("modelbrain-search-console"));
+        assert!(stdio_reply(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#).is_none());
+        let list = stdio_reply(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#).unwrap();
+        assert_eq!(list["result"]["tools"].as_array().unwrap().len(), 5);
+        let call = stdio_reply(r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"list_sites"}}"#).unwrap();
+        assert_eq!(call["result"]["isError"], json!(true));
+        assert_eq!(stdio_reply("not json").unwrap()["error"]["code"], json!(-32700));
+        assert_eq!(stdio_reply(r#"{"jsonrpc":"2.0","id":4,"method":"x"}"#).unwrap()["error"]["code"], json!(-32601));
     }
 
     #[test]
