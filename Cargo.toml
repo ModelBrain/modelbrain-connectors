@@ -1,0 +1,30 @@
+[package]
+name = "modelbrain-connectors"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "MIT"
+repository = "https://github.com/ModelBrain/modelbrain-connectors"
+homepage = "https://modelbrain.net/"
+description = "Free hosted MCP connectors from ModelBrain (Search Console first)"
+
+[[bin]]
+name = "modelbrain_connectors"
+path = "src/main.rs"
+
+[dependencies]
+axum = "0.8"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rusqlite = { version = "0.41", features = ["bundled"] }
+chacha20poly1305 = "0.10"
+sha2 = "0.10"
+base64 = "0.22"
+rand = "0.8"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+percent-encoding = "2"
+url = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
