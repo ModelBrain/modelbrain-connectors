@@ -399,6 +399,13 @@ async fn resolve_client(st: &Shared, client_id: &str) -> rusqlite::Result<Option
 }
 
 const CONSENT_COOKIE: &str = "__Host-mbc_consent";
+
+/// One cookie per sign-in, named by its id, so a second sign-in page opened in the same browser
+/// (an app that loads the authorize address twice, or a retry while an old window is open) does
+/// not overwrite the first page's cookie.
+fn consent_cookie(id: &str) -> String {
+    format!("{CONSENT_COOKIE}_{id}")
+}
 const CONSENT_TTL: i64 = 600;
 
 /// A sign-in waiting for the person to confirm the app, held in memory (a restart only means
@@ -465,13 +472,14 @@ button{{font:inherit;padding:10px 18px;border-radius:6px;border:1px solid #f5b04
     let mut res = (StatusCode::OK, Html(html)).into_response();
     let h = res.headers_mut();
     if let Ok(v) = HeaderValue::from_str(&format!(
-        "{CONSENT_COOKIE}={cookie}; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age={CONSENT_TTL}"
+        "{}={cookie}; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age={CONSENT_TTL}",
+        consent_cookie(&id)
     )) {
         h.insert(header::SET_COOKIE, v);
     }
     h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     h.insert("x-frame-options", HeaderValue::from_static("DENY"));
-    h.insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_static("frame-ancestors 'none'; form-action 'self'"));
+    h.insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_static("frame-ancestors 'none'"));
     res
 }
 
@@ -500,7 +508,7 @@ async fn consent(State(st): State<Shared>, headers: HeaderMap, Form(f): Form<Con
             "This sign-in expired, was already used, or was opened in another browser. Go back to your app and connect again.",
         )
     };
-    let cookie_hash = cookie_value(&headers, CONSENT_COOKIE).map(|c| hash_token(&c));
+    let cookie_hash = cookie_value(&headers, &consent_cookie(&f.id)).map(|c| hash_token(&c));
     let waiting = {
         let mut map = st.consents.lock().unwrap_or_else(|e| e.into_inner());
         // Taken whatever happens next: one answer per page.
@@ -523,7 +531,7 @@ async fn consent(State(st): State<Shared>, headers: HeaderMap, Form(f): Form<Con
         return server_error(e);
     }
     let mut res = to_google(&st, &c.pending.id);
-    if let Ok(v) = HeaderValue::from_str(&format!("{CONSENT_COOKIE}=; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=0")) {
+    if let Ok(v) = HeaderValue::from_str(&format!("{}=; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=0", consent_cookie(&c.pending.id))) {
         res.headers_mut().insert(header::SET_COOKIE, v);
     }
     res
@@ -912,8 +920,12 @@ mod tests {
         let st = state();
         let res = consent_page(&st, waiting("p1"), "Totally ChatGPT");
         let cookie = set_cookie(&res);
-        assert!(cookie.starts_with("__Host-mbc_consent="));
+        assert!(cookie.starts_with("__Host-mbc_consent_p1="));
         assert_eq!(res.headers().get("x-frame-options").unwrap(), "DENY");
+        // The form's answer is a redirect to Google or back to the app, so form-action must not
+        // pin it to this host (browsers apply form-action to the redirect too).
+        let csp = res.headers().get(header::CONTENT_SECURITY_POLICY).unwrap().to_str().unwrap();
+        assert!(csp.contains("frame-ancestors 'none'") && !csp.contains("form-action"), "{csp}");
         let body = axum::body::to_bytes(res.into_body(), 1 << 20).await.unwrap();
         let html = String::from_utf8(body.to_vec()).unwrap();
         assert!(html.contains("glama.ai") && html.contains("Anyone can give an app any name"));
@@ -945,6 +957,30 @@ mod tests {
         let loc = res.headers().get(header::LOCATION).unwrap().to_str().unwrap().to_string();
         assert!(loc.starts_with("https://glama.ai/oauth/callback?error=access_denied") && loc.contains("state=s1"));
         assert!(st.store.take_pending("p3").unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn two_sign_in_pages_in_one_browser_each_keep_their_cookie() {
+        let st = state();
+        let first = consent_page(&st, waiting("a1"), "Glama");
+        let second = consent_page(&st, waiting("a2"), "Glama");
+        // The browser now holds both cookies; answering the first page still works.
+        let mut h = HeaderMap::new();
+        h.insert(
+            header::COOKIE,
+            HeaderValue::from_str(&format!("{}; {}", set_cookie(&first), set_cookie(&second))).unwrap(),
+        );
+        let res = consent(State(st.clone()), h.clone(), Form(ConsentForm { id: "a1".into(), action: "allow".into() })).await;
+        assert_eq!(res.status(), StatusCode::SEE_OTHER);
+        let res = consent(State(st.clone()), h, Form(ConsentForm { id: "a2".into(), action: "allow".into() })).await;
+        assert_eq!(res.status(), StatusCode::SEE_OTHER);
+        // One page's cookie does not answer another page.
+        let third = consent_page(&st, waiting("a3"), "Glama");
+        let _ = third;
+        let mut h = HeaderMap::new();
+        h.insert(header::COOKIE, HeaderValue::from_str(&set_cookie(&first).replace("_a1=", "_a3=")).unwrap());
+        let res = consent(State(st.clone()), h, Form(ConsentForm { id: "a3".into(), action: "allow".into() })).await;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
     }
 
     #[test]
