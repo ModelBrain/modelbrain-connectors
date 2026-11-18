@@ -18,16 +18,17 @@ Every tool is marked `readOnlyHint: true`. The only Google scope requested is `w
 
 ## How sign-in works
 
-1. The AI app registers itself (`/register`, RFC 7591) and sends the person to `/authorize` with a PKCE S256 challenge.
-2. We send them to Google, asking for `openid` and the one read-only scope, with offline access.
-3. Google returns to `/oauth/google/callback`. We read the account ID from the ID token, seal the Google refresh token with ChaCha20-Poly1305 and store it.
-4. The app swaps a one-time code at `/token` for our own access token (1 hour) and refresh token (90 days, rotated on use).
+1. The AI app identifies itself, either with a client metadata document (an https URL as its `client_id`, which we fetch from public addresses only and check) or by registering (`/register`, RFC 7591). It sends the person to `/authorize` with a PKCE S256 challenge.
+2. Claude, ChatGPT, Cursor and apps that call back to the person's own computer go straight on. Any other app first gets a consent page naming its verified domain, or the address it sends access to, because Google's own screen names this connector, not the app.
+3. We send them to Google, asking for `openid` and the one read-only scope, with offline access.
+4. Google returns to `/oauth/google/callback`. We read the account ID from the ID token, seal the Google refresh token with ChaCha20-Poly1305 and store it.
+5. The app swaps a one-time code at `/token` for our own access token (1 hour) and refresh token (90 days, rotated on use).
 
 ## What is stored
 
 - Google account ID and the sealed Google refresh token.
 - SHA-256 hashes of our own codes and tokens.
-- Registered app names and redirect addresses.
+- App names and redirect addresses, from registration or from their metadata documents.
 
 Search data passes straight through and is never stored. Logs hold method, tool name, outcome and duration only. No email addresses are kept.
 
@@ -41,7 +42,7 @@ Search data passes straight through and is never stored. Logs hold method, tool 
 | `DB_PATH` | SQLite file, default `connectors.db` |
 | `GOOGLE_OAUTH_JSON_FILE` | Path to the client JSON downloaded from Google Cloud (or set `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET`, each also as `*_FILE`) |
 | `TOKEN_KEY` / `TOKEN_KEY_FILE` | 32 random bytes, base64 (`openssl rand -base64 32`). Losing it signs everyone out. |
-| `EXTRA_REDIRECT_HOSTS` | Comma-separated extra https hosts allowed as app callbacks |
+| `EXTRA_REDIRECT_HOSTS` | Comma-separated extra https hosts treated as known apps (no consent page). Any well-formed callback may connect either way. |
 | `CALLS_PER_MINUTE` | Per-account tool call limit, default 60 |
 | `RUST_LOG` | Log filter, default `info` |
 

@@ -37,15 +37,19 @@ pub fn routes() -> Router<Shared> {
         .route("/.well-known/oauth-protected-resource/mcp", get(pr_metadata))
         .route("/register", post(register))
         .route("/authorize", get(authorize))
+        .route("/authorize/consent", post(consent))
         .route("/oauth/google/callback", get(google_callback))
         .route("/token", post(token))
 }
 
 // ---------------------------------------------------------------------------
-// Redirect allowlist
+// Redirect rule and known apps
 // ---------------------------------------------------------------------------
 
-const ALLOWED_HTTPS_HOSTS: [&str; 7] = [
+/// Apps whose sign-in addresses are on these domains go straight to Google: Claude, ChatGPT and
+/// Cursor, plus any host in EXTRA_REDIRECT_HOSTS. Any other app sees our consent page first. This
+/// list decides that one step, never whether an app may connect.
+const KNOWN_HTTPS_HOSTS: [&str; 7] = [
     "claude.ai",
     "claude.com",
     "anthropic.com",
@@ -59,31 +63,61 @@ fn host_matches(host: &str, base: &str) -> bool {
     host == base || host.ends_with(&format!(".{base}"))
 }
 
-/// Which redirect URIs a client may register. Hosted apps must use https on
-/// their own domains; local apps may use loopback http or their own scheme.
-pub fn redirect_allowed(raw: &str, extra_hosts: &[String]) -> bool {
+fn loopback(u: &url::Url) -> bool {
+    u.scheme() == "http" && matches!(u.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"))
+}
+
+/// Which redirect addresses a client may use. Any app may connect (MCP authorization: dynamic
+/// registration and client metadata documents), so this is about the address's shape, not which
+/// app it is: https on a DNS name with the default port and no query, loopback http on any port
+/// (RFC 8252), or a desktop editor's own scheme. Never userinfo or a fragment.
+pub fn redirect_allowed(raw: &str) -> bool {
+    if raw.len() > 512 || raw.chars().any(|c| c.is_control() || c == ' ' || c == '\\') {
+        return false;
+    }
     let Ok(u) = url::Url::parse(raw) else {
         return false;
     };
-    if u.fragment().is_some() {
+    if u.fragment().is_some() || !u.username().is_empty() || u.password().is_some() {
         return false;
     }
     match u.scheme() {
         "https" => {
-            let Some(host) = u.host_str() else {
-                return false;
-            };
-            let host = host.to_ascii_lowercase();
-            ALLOWED_HTTPS_HOSTS
-                .iter()
-                .copied()
-                .chain(extra_hosts.iter().map(String::as_str))
-                .any(|base| host_matches(&host, base))
+            matches!(u.host(), Some(url::Host::Domain(h)) if h.contains('.'))
+                && u.port().is_none()
+                && u.query().is_none()
+                && u.path().len() > 1
         }
-        "http" => matches!(u.host_str(), Some("localhost" | "127.0.0.1" | "[::1]")),
+        "http" => loopback(&u),
         "cursor" | "vscode" | "vscode-insiders" | "windsurf" => true,
         _ => false,
     }
+}
+
+/// Whether a sign-in may go straight to Google, or shows our consent page first. A Google consent
+/// screen names this connector, not the app that receives the access, so for an app that is not a
+/// known one the person confirms the app here. Loopback and editor-scheme addresses come back to
+/// the person's own computer, so they need no extra step.
+pub fn needs_consent(redirect_uri: &str, client_id: &str, extra_hosts: &[String]) -> bool {
+    let Ok(u) = url::Url::parse(redirect_uri) else {
+        return true;
+    };
+    if u.scheme() != "https" {
+        return false;
+    }
+    let host = u.host_str().unwrap_or_default().to_ascii_lowercase();
+    let known = |h: &str| {
+        KNOWN_HTTPS_HOSTS
+            .iter()
+            .copied()
+            .chain(extra_hosts.iter().map(String::as_str))
+            .any(|base| host_matches(h, base))
+    };
+    if known(&host) {
+        return false;
+    }
+    // A metadata document app on a trusted domain is known too.
+    !crate::client_meta::host_of(client_id).is_some_and(|h| known(&h))
 }
 
 /// Exact match, except that loopback addresses may use any port (RFC 8252
@@ -95,7 +129,6 @@ pub fn redirect_matches(registered: &str, requested: &str) -> bool {
     let (Ok(a), Ok(b)) = (url::Url::parse(registered), url::Url::parse(requested)) else {
         return false;
     };
-    let loopback = |u: &url::Url| u.scheme() == "http" && matches!(u.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"));
     loopback(&a)
         && loopback(&b)
         && a.host_str() == b.host_str()
@@ -178,6 +211,8 @@ async fn as_metadata(State(st): State<Shared>) -> Json<Value> {
         "code_challenge_methods_supported": ["S256"],
         "token_endpoint_auth_methods_supported": ["none"],
         "scopes_supported": [st.cfg.connector.local_scope()],
+        // An app may use an https URL as its client_id instead of registering.
+        "client_id_metadata_document_supported": true,
     }))
 }
 
@@ -228,12 +263,12 @@ async fn register(State(st): State<Shared>, Json(body): Json<RegisterBody>) -> R
     if let Some(bad) = body
         .redirect_uris
         .iter()
-        .find(|u| u.len() > 512 || !redirect_allowed(u, &st.cfg.extra_redirect_hosts))
+        .find(|u| !redirect_allowed(u))
     {
         return oauth_error(
             StatusCode::BAD_REQUEST,
             "invalid_redirect_uri",
-            &format!("Redirect URI not allowed: {bad}"),
+            &format!("Redirect URI not allowed: {bad}. Use https with the default port and no query, loopback http, or an editor's own scheme."),
         );
     }
     let client_name: String = body
@@ -288,8 +323,11 @@ async fn authorize(State(st): State<Shared>, Query(q): Query<AuthorizeQuery>) ->
     let Some(client_id) = q.client_id.as_deref() else {
         return bad("The app did not say who it is (client_id is missing).");
     };
-    let client = match st.store.client(client_id) {
+    let client = match resolve_client(&st, client_id).await {
         Ok(Some(c)) => c,
+        Ok(None) if crate::client_meta::is_document_url(client_id) => {
+            return bad("This app's sign-in details could not be read from its website. Try again in a minute, or contact the app's makers.")
+        }
         Ok(None) => return bad("This app is not registered here. Remove the connector in your app and add it again."),
         Err(e) => return server_error(e),
     };
@@ -324,10 +362,175 @@ async fn authorize(State(st): State<Shared>, Query(q): Query<AuthorizeQuery>) ->
         code_challenge: challenge,
         client_state: q.state.map(|s| s.chars().take(1024).collect()),
     };
+    if needs_consent(&pending.redirect_uri, &pending.client_id, &st.cfg.extra_redirect_hosts) {
+        return consent_page(&st, pending, &client.client_name);
+    }
     if let Err(e) = st.store.insert_pending(&pending) {
         return server_error(e);
     }
+    to_google(&st, &pending.id)
+}
 
+/// A client by the id the app presents: a registered one, or a metadata document URL, fetched and
+/// checked on first use and again once the stored copy is an hour old. A copy up to a day old
+/// stands in when the app's server does not answer.
+async fn resolve_client(st: &Shared, client_id: &str) -> rusqlite::Result<Option<ClientRow>> {
+    if !crate::client_meta::is_document_url(client_id) {
+        return st.store.client(client_id);
+    }
+    let stored = st.store.client_with_age(client_id)?;
+    let now = crate::store::now();
+    if let Some((row, checked)) = &stored {
+        if now - checked < crate::client_meta::FRESH_SECS {
+            return Ok(Some(row.clone()));
+        }
+    }
+    let Some(body) = crate::client_meta::fetch(client_id).await else {
+        return Ok(stored.filter(|(_, checked)| now - checked < 24 * 3600).map(|(r, _)| r));
+    };
+    let Some((name, uris)) = crate::client_meta::parse_document(client_id, &body, redirect_allowed) else {
+        tracing::info!(event = "client_metadata_invalid", host = ?crate::client_meta::host_of(client_id));
+        return Ok(None);
+    };
+    let row = ClientRow { client_id: client_id.to_string(), client_name: name, redirect_uris: uris };
+    st.store.upsert_client(&row)?;
+    tracing::info!(event = "client_metadata_checked", host = ?crate::client_meta::host_of(client_id));
+    Ok(Some(row))
+}
+
+const CONSENT_COOKIE: &str = "__Host-mbc_consent";
+const CONSENT_TTL: i64 = 600;
+
+/// A sign-in waiting for the person to confirm the app, held in memory (a restart only means
+/// starting again). Nothing reaches the pending table, and so Google, until the person confirms
+/// in the same browser: the cookie set with this page must come back with the form.
+pub struct Consent {
+    pending: PendingAuth,
+    cookie_hash: String,
+    expires: i64,
+}
+
+fn consent_page(st: &Shared, pending: PendingAuth, client_name: &str) -> Response {
+    let cookie = random_token(24);
+    let id = pending.id.clone();
+    let host = url::Url::parse(&pending.redirect_uri)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_string))
+        .unwrap_or_default();
+    let verified = crate::client_meta::host_of(&pending.client_id);
+    {
+        let mut map = st.consents.lock().unwrap_or_else(|e| e.into_inner());
+        let now = crate::store::now();
+        map.retain(|_, c| c.expires > now);
+        if map.len() > 5000 {
+            return message_page(StatusCode::SERVICE_UNAVAILABLE, "Busy", "Too many sign-ins are waiting. Try again in a few minutes.");
+        }
+        map.insert(id.clone(), Consent { pending, cookie_hash: hash_token(&cookie), expires: now + CONSENT_TTL });
+    }
+    let who = match &verified {
+        Some(v) if *v == host => format!("<strong>{}</strong> ({})", escape_html(client_name), escape_html(v)),
+        Some(v) => format!(
+            "<strong>{}</strong> ({}), which sends access to <strong>{}</strong>",
+            escape_html(client_name),
+            escape_html(v),
+            escape_html(&host)
+        ),
+        None => format!(
+            "An app calling itself <strong>{}</strong>, which sends access to <strong>{}</strong>. Anyone can give an app any name, so continue only if you started this yourself just now.",
+            escape_html(client_name),
+            escape_html(&host)
+        ),
+    };
+    let name = escape_html(st.cfg.connector.display_name());
+    let html = format!(
+        r#"<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex"><title>Connect {name} | ModelBrain</title>
+<style>
+body{{margin:0;font:16px/1.6 system-ui,-apple-system,Segoe UI,sans-serif;background:#0d0d0f;color:#e8e6e3}}
+main{{max-width:560px;margin:12vh auto;padding:0 20px}}
+h1{{font-size:1.4rem;color:#f5b041}}a{{color:#f5b041}}
+button{{font:inherit;padding:10px 18px;border-radius:6px;border:1px solid #f5b041;margin-right:10px;cursor:pointer}}
+.go{{background:#f5b041;color:#0d0d0f}}.no{{background:transparent;color:#e8e6e3}}
+</style></head><body><main><h1>Connect {name}</h1>
+<p>{who} wants read-only access to your Google Search Console data.</p>
+<p>Next, Google asks you to choose an account and allow access.</p>
+<form method="post" action="/authorize/consent">
+<input type="hidden" name="id" value="{id}">
+<button class="go" type="submit" name="action" value="allow">Continue with Google</button>
+<button class="no" type="submit" name="action" value="deny">Cancel</button>
+</form></main></body></html>"#,
+        id = escape_html(&id),
+    );
+    let mut res = (StatusCode::OK, Html(html)).into_response();
+    let h = res.headers_mut();
+    if let Ok(v) = HeaderValue::from_str(&format!(
+        "{CONSENT_COOKIE}={cookie}; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age={CONSENT_TTL}"
+    )) {
+        h.insert(header::SET_COOKIE, v);
+    }
+    h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    h.insert("x-frame-options", HeaderValue::from_static("DENY"));
+    h.insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_static("frame-ancestors 'none'; form-action 'self'"));
+    res
+}
+
+#[derive(Deserialize)]
+struct ConsentForm {
+    id: String,
+    action: String,
+}
+
+fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
+    headers
+        .get_all(header::COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(';'))
+        .filter_map(|p| p.trim().split_once('='))
+        .find(|(k, _)| *k == name)
+        .map(|(_, v)| v.to_string())
+}
+
+async fn consent(State(st): State<Shared>, headers: HeaderMap, Form(f): Form<ConsentForm>) -> Response {
+    let expired = || {
+        message_page(
+            StatusCode::BAD_REQUEST,
+            "Sign-in expired",
+            "This sign-in expired, was already used, or was opened in another browser. Go back to your app and connect again.",
+        )
+    };
+    let cookie_hash = cookie_value(&headers, CONSENT_COOKIE).map(|c| hash_token(&c));
+    let waiting = {
+        let mut map = st.consents.lock().unwrap_or_else(|e| e.into_inner());
+        // Taken whatever happens next: one answer per page.
+        map.remove(&f.id)
+    };
+    let Some(c) = waiting else {
+        return expired();
+    };
+    if c.expires <= crate::store::now() || cookie_hash.as_deref() != Some(c.cookie_hash.as_str()) {
+        return expired();
+    }
+    if f.action != "allow" {
+        let mut pairs = vec![("error", "access_denied"), ("error_description", "The person cancelled")];
+        if let Some(s) = c.pending.client_state.as_deref() {
+            pairs.push(("state", s));
+        }
+        return redirect_with(&c.pending.redirect_uri, &pairs);
+    }
+    if let Err(e) = st.store.insert_pending(&c.pending) {
+        return server_error(e);
+    }
+    let mut res = to_google(&st, &c.pending.id);
+    if let Ok(v) = HeaderValue::from_str(&format!("{CONSENT_COOKIE}=; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=0")) {
+        res.headers_mut().insert(header::SET_COOKIE, v);
+    }
+    res
+}
+
+/// Sends the browser to Google for one read-only scope, carrying the pending sign-in's id.
+fn to_google(st: &Shared, pending_id: &str) -> Response {
     let scope = format!("openid {}", st.cfg.connector.google_scope());
     let google = url::Url::parse_with_params(
         GOOGLE_AUTH_URL,
@@ -339,7 +542,7 @@ async fn authorize(State(st): State<Shared>, Query(q): Query<AuthorizeQuery>) ->
             ("access_type", "offline"),
             ("prompt", "consent"),
             ("include_granted_scopes", "false"),
-            ("state", pending.id.as_str()),
+            ("state", pending_id),
         ],
     );
     match google {
@@ -630,28 +833,118 @@ mod tests {
     use super::*;
 
     #[test]
-    fn allowlist() {
+    fn redirect_rule_is_about_shape() {
+        for ok in [
+            "https://claude.ai/api/mcp/auth_callback",
+            "https://chatgpt.com/connector_platform_oauth_redirect",
+            "https://www.cursor.com/cb",
+            "https://glama.ai/oauth/callback",
+            "http://localhost:6274/oauth/callback",
+            "http://127.0.0.1:33418/cb",
+            "http://[::1]:8080/cb",
+            "cursor://anysphere.cursor-retrieval/oauth/callback",
+            "vscode://cb",
+        ] {
+            assert!(redirect_allowed(ok), "{ok}");
+        }
+        for bad in [
+            "http://claude.ai/cb",
+            "http://192.168.1.5/cb",
+            "https://claude.ai/cb#frag",
+            "https://claude.ai/cb?next=x",
+            "https://claude.ai:8443/cb",
+            "https://10.0.0.1/cb",
+            "https://localhost/cb",
+            "https://user@claude.ai/cb",
+            "https://claude.ai",
+            "javascript:alert(1)",
+            "not a url",
+        ] {
+            assert!(!redirect_allowed(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn known_apps_skip_the_consent_page_and_others_do_not() {
         let none: Vec<String> = vec![];
-        assert!(redirect_allowed("https://claude.ai/api/mcp/auth_callback", &none));
-        assert!(redirect_allowed("https://chatgpt.com/connector_platform_oauth_redirect", &none));
-        assert!(redirect_allowed("https://www.cursor.com/cb", &none));
-        assert!(redirect_allowed("http://localhost:6274/oauth/callback", &none));
-        assert!(redirect_allowed("http://127.0.0.1:33418/cb", &none));
-        assert!(redirect_allowed("http://[::1]:8080/cb", &none));
-        assert!(redirect_allowed("cursor://anysphere.cursor-retrieval/oauth/callback", &none));
-        assert!(redirect_allowed("vscode://cb", &none));
+        assert!(!needs_consent("https://claude.ai/api/mcp/auth_callback", "mbc_x", &none));
+        assert!(!needs_consent("https://chatgpt.com/connector_platform_oauth_redirect", "mbc_x", &none));
+        assert!(!needs_consent("http://localhost:6274/oauth/callback", "mbc_x", &none));
+        assert!(!needs_consent("cursor://anysphere.cursor-retrieval/oauth/callback", "mbc_x", &none));
+        assert!(needs_consent("https://glama.ai/oauth/callback", "mbc_x", &none));
+        assert!(needs_consent("https://claude.ai.evil.com/cb", "mbc_x", &none));
+        // A metadata document proves the app's domain, but only a known domain skips the page.
+        assert!(needs_consent("https://glama.ai/cb", "https://glama.ai/oauth/client.json", &none));
+        let extra = vec!["glama.ai".to_string()];
+        assert!(!needs_consent("https://glama.ai/cb", "mbc_x", &extra));
+        assert!(!needs_consent("https://cb.example.com/cb", "https://glama.ai/oauth/client.json", &extra));
+    }
 
-        assert!(!redirect_allowed("https://evil.com/cb", &none));
-        assert!(!redirect_allowed("https://claude.ai.evil.com/cb", &none));
-        assert!(!redirect_allowed("https://notclaude.ai/cb", &none));
-        assert!(!redirect_allowed("http://claude.ai/cb", &none));
-        assert!(!redirect_allowed("http://192.168.1.5/cb", &none));
-        assert!(!redirect_allowed("https://claude.ai/cb#frag", &none));
-        assert!(!redirect_allowed("javascript:alert(1)", &none));
-        assert!(!redirect_allowed("not a url", &none));
+    fn state() -> Shared {
+        let cfg = crate::config::Config::for_tests();
+        std::sync::Arc::new(crate::AppState {
+            limiter: crate::mcp::RateLimiter::new(cfg.calls_per_minute),
+            cfg,
+            store: crate::store::Store::open_in_memory().unwrap(),
+            http: reqwest::Client::new(),
+            google: crate::google::Google::default(),
+            consents: Default::default(),
+        })
+    }
 
-        let extra = vec!["example.dev".to_string()];
-        assert!(redirect_allowed("https://app.example.dev/cb", &extra));
+    fn waiting(id: &str) -> PendingAuth {
+        PendingAuth {
+            id: id.into(),
+            client_id: "mbc_test".into(),
+            redirect_uri: "https://glama.ai/oauth/callback".into(),
+            code_challenge: "c".repeat(43),
+            client_state: Some("s1".into()),
+        }
+    }
+
+    fn set_cookie(res: &Response) -> String {
+        let v = res.headers().get(header::SET_COOKIE).unwrap().to_str().unwrap();
+        v.split(';').next().unwrap().to_string()
+    }
+
+    #[tokio::test]
+    async fn the_consent_page_names_the_destination_and_needs_its_own_browser() {
+        let st = state();
+        let res = consent_page(&st, waiting("p1"), "Totally ChatGPT");
+        let cookie = set_cookie(&res);
+        assert!(cookie.starts_with("__Host-mbc_consent="));
+        assert_eq!(res.headers().get("x-frame-options").unwrap(), "DENY");
+        let body = axum::body::to_bytes(res.into_body(), 1 << 20).await.unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+        assert!(html.contains("glama.ai") && html.contains("Anyone can give an app any name"));
+        // Nothing reaches Google's pending table before the person confirms.
+        assert!(st.store.take_pending("p1").unwrap().is_none());
+
+        // Another browser (no cookie) gets nothing, and the request is spent.
+        let res = consent(State(st.clone()), HeaderMap::new(), Form(ConsentForm { id: "p1".into(), action: "allow".into() })).await;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        assert!(st.store.take_pending("p1").unwrap().is_none());
+
+        // The right browser goes on to Google.
+        let res = consent_page(&st, waiting("p2"), "Glama");
+        let mut h = HeaderMap::new();
+        h.insert(header::COOKIE, HeaderValue::from_str(&set_cookie(&res)).unwrap());
+        let res = consent(State(st.clone()), h.clone(), Form(ConsentForm { id: "p2".into(), action: "allow".into() })).await;
+        assert_eq!(res.status(), StatusCode::SEE_OTHER);
+        assert!(res.headers().get(header::LOCATION).unwrap().to_str().unwrap().starts_with(GOOGLE_AUTH_URL));
+        assert!(st.store.take_pending("p2").unwrap().is_some());
+        // Used once.
+        let res = consent(State(st.clone()), h, Form(ConsentForm { id: "p2".into(), action: "allow".into() })).await;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+
+        // Cancel goes back to the app with access_denied.
+        let res = consent_page(&st, waiting("p3"), "Glama");
+        let mut h = HeaderMap::new();
+        h.insert(header::COOKIE, HeaderValue::from_str(&set_cookie(&res)).unwrap());
+        let res = consent(State(st.clone()), h, Form(ConsentForm { id: "p3".into(), action: "deny".into() })).await;
+        let loc = res.headers().get(header::LOCATION).unwrap().to_str().unwrap().to_string();
+        assert!(loc.starts_with("https://glama.ai/oauth/callback?error=access_denied") && loc.contains("state=s1"));
+        assert!(st.store.take_pending("p3").unwrap().is_none());
     }
 
     #[test]

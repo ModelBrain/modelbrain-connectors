@@ -142,6 +142,40 @@ impl Store {
             .optional()
     }
 
+    /// Stores (or refreshes) a client that identified itself with a metadata document; its
+    /// client_id is the document URL and `created` records when the document was last checked.
+    pub fn upsert_client(&self, row: &ClientRow) -> rusqlite::Result<()> {
+        let uris = serde_json::to_string(&row.redirect_uris).unwrap_or_else(|_| "[]".into());
+        self.c().execute(
+            "INSERT INTO clients(client_id, client_name, redirect_uris, created) VALUES(?1,?2,?3,?4)
+             ON CONFLICT(client_id) DO UPDATE SET client_name=excluded.client_name,
+               redirect_uris=excluded.redirect_uris, created=excluded.created",
+            params![row.client_id, row.client_name, uris, now()],
+        )?;
+        Ok(())
+    }
+
+    /// A client and when it was stored (for a metadata document client: last checked).
+    pub fn client_with_age(&self, client_id: &str) -> rusqlite::Result<Option<(ClientRow, i64)>> {
+        self.c()
+            .query_row(
+                "SELECT client_id, client_name, redirect_uris, created FROM clients WHERE client_id=?1",
+                params![client_id],
+                |r| {
+                    let uris: String = r.get(2)?;
+                    Ok((
+                        ClientRow {
+                            client_id: r.get(0)?,
+                            client_name: r.get(1)?,
+                            redirect_uris: serde_json::from_str(&uris).unwrap_or_default(),
+                        },
+                        r.get::<_, i64>(3)?,
+                    ))
+                },
+            )
+            .optional()
+    }
+
     pub fn insert_pending(&self, p: &PendingAuth) -> rusqlite::Result<()> {
         self.c().execute(
             "INSERT INTO pending(id, client_id, redirect_uri, code_challenge, client_state, created)

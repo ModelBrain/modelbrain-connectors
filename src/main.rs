@@ -1,6 +1,7 @@
 //! ModelBrain free connectors: hosted, read-only MCP servers.
 //! One process serves one connector (CONNECTOR=gsc for Search Console).
 
+mod client_meta;
 mod config;
 mod crypto;
 mod google;
@@ -23,6 +24,8 @@ pub struct AppState {
     pub http: reqwest::Client,
     pub google: google::Google,
     pub limiter: mcp::RateLimiter,
+    /// Sign-ins waiting for the person to confirm an app that is not a known one.
+    pub consents: std::sync::Mutex<std::collections::HashMap<String, oauth::Consent>>,
 }
 
 pub type Shared = Arc<AppState>;
@@ -145,6 +148,7 @@ async fn main() {
         store,
         http,
         google: google::Google::default(),
+        consents: Default::default(),
     });
 
     let purge = state.clone();
@@ -191,6 +195,7 @@ mod tests {
             store: store::Store::open_in_memory().unwrap(),
             http: reqwest::Client::new(),
             google: google::Google::default(),
+            consents: Default::default(),
         })
     }
 
